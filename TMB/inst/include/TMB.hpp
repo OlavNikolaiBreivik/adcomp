@@ -56,10 +56,61 @@ void eigen_REprintf(const char* x);
 /* Workaround side effect when -DEIGEN_USE_LAPACKE is set */
 #undef I
 
+/* Select AD framework: TMBAD or CPPAD  */
+#ifndef CPPAD_FRAMEWORK
+#ifndef TMBAD_FRAMEWORK
+#define TMBAD_FRAMEWORK
+#endif
+#endif
+
 /* Include the CppAD library. (Always turn off debug for cppad) */
 #undef NDEBUG
 #define NDEBUG 1
 #include "cppad/cppad.hpp"
+#ifdef TMBAD_FRAMEWORK
+#include "TMBad/TMBad.hpp"
+#include "TMBad/tmbad_allow_comparison.hpp"
+#include "TMBad/eigen_numtraits.hpp"
+#undef error
+#include "TMBad/compile.hpp"
+#include "TMBad/graph2dot.hpp"
+#include "TMBad/compression.hpp"
+#ifndef WITH_LIBTMB
+#include "TMBad/TMBad.cpp"
+#endif
+#define error Rf_error
+// Workaround to make CppAD::Integer working with TMBad
+namespace CppAD {
+int Integer(const TMBad::ad_aug &x) CSKIP ({ return (int) x.Value(); })
+TMBad::ad_aug abs(const TMBad::ad_aug &x) CSKIP ({ return TMBad::fabs(x); })
+#define TMBAD_CONDEXP(NAME)                             \
+TMBad::ad_aug CondExp ## NAME(                          \
+  const TMBad::ad_aug &x0,                              \
+  const TMBad::ad_aug &x1,                              \
+  const TMBad::ad_aug &x2,                              \
+  const TMBad::ad_aug &x3) CSKIP ( {                    \
+      return TMBad::CondExp ## NAME(x0, x1, x2, x3);    \
+})
+TMBAD_CONDEXP(Eq)
+TMBAD_CONDEXP(Ne)
+TMBAD_CONDEXP(Lt)
+TMBAD_CONDEXP(Gt)
+TMBAD_CONDEXP(Le)
+TMBAD_CONDEXP(Ge)
+#undef TMBAD_CONDEXP
+bool Variable(const TMBad::ad_aug &x) CSKIP ({ return !x.constant(); })
+}
+// FIXME: Move to TMBad source?
+namespace TMBad {
+  /* Add 'isfinite', 'isinf' and 'isnan' to TMBad */
+  using std::isfinite;
+  bool isfinite(const TMBad::ad_aug &x)CSKIP({ return isfinite(x.Value()); })
+  using std::isinf;
+  bool isinf(const TMBad::ad_aug &x)CSKIP({ return isinf(x.Value()); })
+  using std::isnan;
+  bool isnan(const TMBad::ad_aug &x)CSKIP({ return isnan(x.Value()); })
+}
+#endif
 
 /* Include the R library _after_ Eigen and CppAD. Otherwise, the R
    macros can cause conflicts (as they do not respect the Eigen and
@@ -90,6 +141,7 @@ namespace CppAD{
 }
 #include "convert.hpp" // asSEXP, asMatrix, asVector
 #include "config.hpp"
+#include "tmbutils/getListElement.hpp"
 #include "atomic_math.hpp"
 #include "expm.hpp"
 #include "atomic_convolve.hpp"
@@ -100,6 +152,7 @@ namespace CppAD{
 #include "dnorm.hpp"   // harmless
 #include "lgamma.hpp"  // harmless
 #include "start_parallel.hpp"
+#include "tmbutils/newton.hpp" // Newton solver + Laplace used by TransformADFunObject
 #include "tmb_core.hpp"
 #include "distributions_R.hpp"
 #include "convenience.hpp"    // Requires besselK

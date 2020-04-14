@@ -150,7 +150,13 @@ namespace Rmath {
 
 }
 
+#ifdef CPPAD_FRAMEWORK
 #include "atomic_macro.hpp"
+#endif
+
+#ifdef TMBAD_FRAMEWORK
+#include "tmbad_atomic_macro.hpp"
+#endif
 
 template<class Type>
 struct TypeDefs{
