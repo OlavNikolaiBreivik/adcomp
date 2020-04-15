@@ -40,6 +40,10 @@ struct config_struct{
   struct {
     bool getListElement;
   } debug;
+  struct {
+    /** \brief Reduce memory of sparse hessian even if reducing speed ? */
+    bool sparse_hessian_compress;
+  } tmbad;
 
   int cmd;
   SEXP envir; /* PROTECTed because function argument - see
@@ -64,6 +68,7 @@ struct config_struct{
     SET(optimize.instantly,true);
     SET(optimize.parallel,false);
     SET(tape.parallel,true);
+    SET(tmbad.sparse_hessian_compress,false);
   })
 #undef SET
   config_struct() CSKIP(

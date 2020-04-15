@@ -156,10 +156,11 @@ isNullPointer <- function(pointer) {
 ##' @param checkParameterOrder Optional check for correct parameter order.
 ##' @param regexp Match random effects by regular expressions?
 ##' @param silent Disable all tracing information?
+##' @param intern Do Laplace approximation on C++ side ? (Experimental - may change without notice)
 ##' @param ... Currently unused.
 ##' @return List with components (fn, gr, etc) suitable for calling an R optimizer, such as \code{nlminb} or \code{optim}.
 MakeADFun <- function(data, parameters, map=list(),
-                      type=c("ADFun","Fun","ADGrad"[!is.null(random) || !is.null(profile)]),
+                      type=c("ADFun","Fun","ADGrad"[!intern && (!is.null(random) || !is.null(profile)) ] ),
                       random=NULL,
                       profile=NULL,
                       random.start=expression(last.par.best[random]),
@@ -174,6 +175,7 @@ MakeADFun <- function(data, parameters, map=list(),
                       checkParameterOrder=TRUE, ## Optional check
                       regexp=FALSE,
                       silent=FALSE,
+                      intern=FALSE,
                       ...){
   env <- environment() ## This environment
   if(!is.list(data))
@@ -238,7 +240,7 @@ MakeADFun <- function(data, parameters, map=list(),
     ## For safety, check that parameter order match the parameter order in user template.
     ## If not, permute parameter list with a warning.
     ## Order in which parameters were requested:
-    parNameOrder <- .Call("getParameterOrder",data,parameters,new.env(),PACKAGE=DLL)
+    parNameOrder <- .Call("getParameterOrder",data,parameters,new.env(),NULL,PACKAGE=DLL)
     if(!identical(names(parameters),parNameOrder)){
       if(!silent) cat("Order of parameters:\n")
       if(!silent) print(names(parameters))
@@ -350,7 +352,7 @@ MakeADFun <- function(data, parameters, map=list(),
     if(atomic){ ## FIXME: Then no reason to create ptrFun again later ?
       ## User template contains atomic functions ==>
       ## Have to call "double-template" to trigger tape generation
-      Fun <<- .Call("MakeDoubleFunObject",data,parameters,reportenv,PACKAGE=DLL)
+      Fun <<- .Call("MakeDoubleFunObject",data,parameters,reportenv,NULL,PACKAGE=DLL)
       ## Hack: unlist(parameters) only guarantied to be a permutation of the parameter vecter.
       out <- .Call("EvalDoubleFunObject", Fun$ptr, unlist(parameters),
                    control = list(do_simulate = as.integer(0),
@@ -403,7 +405,40 @@ MakeADFun <- function(data, parameters, map=list(),
     }
     if("ADFun"%in%type){
       ADFun <<- .Call("MakeADFunObject",data,parameters,reportenv,
-                     control=list(report=as.integer(ADreport)),PACKAGE=DLL)
+                      control=list(report=as.integer(ADreport)),PACKAGE=DLL)
+      if (intern) {
+          cfg <- inner.control
+          if (is.null(cfg$sparse)) cfg$sparse <- TRUE
+          cfg <- lapply(cfg, as.double)
+          .Call("TransformADFunObject", ADFun$ptr, list(newton_cfg=cfg,
+                                                        random_order = random,
+                                                        method="laplace",
+                                                        mustWork=1L,
+                                                        max_period_size=1024L),
+                PACKAGE=DLL)
+          .Call("TransformADFunObject", ADFun$ptr,
+                list(
+                    method="remove_random_parameters",
+                    random_order = random,
+                    mustWork=1L,
+                    max_period_size=1024L),
+                PACKAGE=DLL)
+          ## FIXME: Should be done by above .Call
+          attr(ADFun$ptr,"par") <- attr(ADFun$ptr,"par")[-random]
+          ##
+          par <<- par[-random]
+          random <<- NULL
+          ## Run tape optimizer
+          if (config(DLL=DLL)$optimize.instantly) {
+              .Call("TransformADFunObject", ADFun$ptr,
+                    list(
+                        method="optimize",
+                        random_order=integer(0),
+                        mustWork=1L,
+                        max_period_size=1024L),
+                    PACKAGE=DLL)
+          }
+      }
       if (set.defaults) {
           par <<- attr(ADFun$ptr,"par")
           last.par <<- par
@@ -413,10 +448,15 @@ MakeADFun <- function(data, parameters, map=list(),
           value.best <<- Inf
       }
     }
+    if (length(random) > 0) {
+        ## Experiment !
+        .Call("TransformADFunObject", ADFun$ptr, list(random_order = random, method="reorder_random", mustWork=0L, max_period_size=1024L), PACKAGE=DLL)
+    }
     if("Fun"%in%type)
-      Fun <<- .Call("MakeDoubleFunObject",data,parameters,reportenv,PACKAGE=DLL)
-    if("ADGrad"%in%type)
-      ADGrad <<- .Call("MakeADGradObject",data,parameters,reportenv,PACKAGE=DLL)
+      Fun <<- .Call("MakeDoubleFunObject",data,parameters,reportenv,NULL,PACKAGE=DLL)
+    if("ADGrad"%in%type) {
+        retape_adgrad(lazy = TRUE)
+    }
     ## Skip fixed effects from the full hessian ?
     ## * Probably more efficient - especially in terms of memory.
     ## * Only possible if a taped gradient is available - see function "ff" below.
@@ -424,16 +464,24 @@ MakeADFun <- function(data, parameters, map=list(),
     delayedAssign("spHess", sparseHessianFun(env, skipFixedEffects=skipFixedEffects ),
                   assign.env = env)
   }## end{retape}
-
+  ## Lazy / Full adgrad ?
+  retape_adgrad <- function(lazy = TRUE) {
+      ## Use already taped function value
+      control <- list( f = ADFun$ptr )
+      ## In random effects case we only need the 'random' part of the gradient
+      if (lazy && !is.null(random))
+          control$random <- as.integer(random)
+      ADGrad <<- .Call("MakeADGradObject",data,parameters,reportenv,control,PACKAGE=DLL)
+  }
   retape(set.defaults = TRUE)
-
   ## Has atomic functions been generated for the tapes ?
   usingAtomics <- function().Call("usingAtomics", PACKAGE=DLL)
 
   f <- function(theta=par, order=0, type="ADdouble",
                 cols=NULL, rows=NULL,
                 sparsitypattern=0, rangecomponent=1, rangeweight=NULL,
-                dumpstack=0, doforward=1, do_simulate=0) {
+                dumpstack=0, doforward=1, do_simulate=0, set_tail=0,
+                keepx=NULL, keepy=NULL) {
     if(isNullPointer(ADFun$ptr)) {
         if(silent)beSilent()
         ## Loaded or deep copied object: Only restore external
@@ -452,7 +500,8 @@ MakeADFun <- function(data, parameters, map=list(),
                                  rangeweight=rangeweight,
                                  dumpstack=as.integer(dumpstack),
                                  doforward=as.integer(doforward),
-                                 do_simulate=as.integer(do_simulate)
+                                 do_simulate=as.integer(do_simulate),
+                                 set_tail = as.integer(set_tail)
                                ),
                        PACKAGE=DLL
                        )
@@ -475,7 +524,10 @@ MakeADFun <- function(data, parameters, map=list(),
                                     rangecomponent=as.integer(rangecomponent),
                                     rangeweight=rangeweight,
                                     dumpstack=as.integer(dumpstack),
-                                    doforward=as.integer(doforward)),PACKAGE=DLL)
+                                    doforward=as.integer(doforward),
+                                    set_tail = as.integer(set_tail),
+                                    keepx=as.integer(keepx),
+                                    keepy=as.integer(keepy)),PACKAGE=DLL)
         },
         stop("invalid 'type'")) # end{ switch() }
     res
@@ -568,7 +620,8 @@ MakeADFun <- function(data, parameters, map=list(),
                         rangecomponent=as.integer(1),
                         rangeweight=as.double(w),
                         dumpstack=as.integer(0),
-                        doforward=as.integer(1)
+                        doforward=as.integer(1),
+                        set_tail = as.integer(0)
                       ),
               PACKAGE=DLL)
     }## order == 1
@@ -580,7 +633,7 @@ MakeADFun <- function(data, parameters, map=list(),
     f0 <- function(par.random,order=0,...){
       par[random] <- par.random
       par[-random] <- par.fixed
-      res <- f(par,order=order,...)
+      res <- f(par,order=order,set_tail=random[1],...)
       switch(order+1,res,res[random],res[random,random])
     }
     ## sparse hessian
@@ -588,7 +641,7 @@ MakeADFun <- function(data, parameters, map=list(),
       par[random] <- par.random
       par[-random] <- par.fixed
       #spHess(par)[random,random,drop=FALSE]
-      spHess(par,random=TRUE)
+      spHess(par,random=TRUE,set_tail=random[1])
     }
     if(inner.method=="newton"){
       #opt <- newton(eval(random.start),fn=f0,gr=function(x)f0(x,order=1),
@@ -841,7 +894,7 @@ MakeADFun <- function(data, parameters, map=list(),
            if(!atomic) return( f(x,order=2) )
            ## Otherwise, get Hessian as 1st order derivative of gradient:
            if(is.null(ADGrad))
-             ADGrad <<- .Call("MakeADGradObject",data,parameters,reportenv,PACKAGE=DLL)
+             retape_adgrad()
            f(x,type="ADGrad",order=1)
          },
          hessian=hessian, method=method,
@@ -933,11 +986,14 @@ openmp <- function(n=NULL){
 ##' @param libtmb Use precompiled TMB library if available (to speed up compilation)?
 ##' @param libinit Turn on preprocessor flag to register native routines?
 ##' @param tracesweep Turn on preprocessor flag to trace AD sweeps? (Silently disables \code{libtmb})
+##' @param framework Which AD framework to use
 ##' @param ... Passed as Makeconf variables.
 ##' @seealso \code{\link{precompile}}
 compile <- function(file,flags="",safebounds=TRUE,safeunload=TRUE,
                     openmp=isParallelTemplate(file[1]),libtmb=TRUE,
-                    libinit=TRUE,tracesweep=FALSE,...){
+                    libinit=TRUE,tracesweep=FALSE,framework=c("TMBad", "CppAD"),
+                    ...){
+  framework <- match.arg(framework)
   if(.Platform$OS.type=="windows"){
     ## Overload system.file
     system.file <- function(...){
@@ -947,6 +1003,12 @@ compile <- function(file,flags="",safebounds=TRUE,safeunload=TRUE,
   }
   ## Cannot use the pre-compiled library when enabling sweep tracing
   if (tracesweep) libtmb <- FALSE
+  ## Find TMBad framework
+  useTMBad <- (framework == "TMBad")
+  incTMBad <- system.file("include/TMBad", package="TMB")
+  libTMBad <- ""
+  incRcpp <- system.file("include", package="Rcpp")
+  useRcpp <- useTMBad
   ## libtmb existence
   debug <-
       length(grep("-O0", flags)) &&
@@ -1010,16 +1072,20 @@ compile <- function(file,flags="",safebounds=TRUE,safeunload=TRUE,
   ppflags <- paste(paste0("-I",system.file("include",package="TMB")),
                    paste0("-I",system.file("include",package="RcppEigen"))[useRcppEigen],
                    paste0("-I",system.file("include/contrib",package="TMB"))[useContrib],
+                   paste0("-I",incTMBad)[useTMBad],
+                   paste0("-I",incRcpp)[useRcpp],
                    "-DTMB_SAFEBOUNDS"[safebounds],
                    paste0("-DLIB_UNLOAD=R_unload_",libname)[safeunload],
                    "-DWITH_LIBTMB"[libtmb],
                    paste0("-DTMB_LIB_INIT=R_init_",libname)[libinit],
-                   "-DCPPAD_FORWARD0SWEEP_TRACE"[tracesweep]
+                   "-DCPPAD_FORWARD0SWEEP_TRACE"[tracesweep],
+                   paste0("-D",toupper(framework),"_FRAMEWORK")
                    )
   ## Makevars specific for template
   mvfile <- makevars(PKG_CPPFLAGS=ppflags,
                      PKG_LIBS=paste(
-                       "$(SHLIB_OPENMP_CXXFLAGS)"[openmp] ),
+                         "$(SHLIB_OPENMP_CXXFLAGS)"[openmp],
+                         libTMBad[useTMBad] ),
                      PKG_CXXFLAGS="$(SHLIB_OPENMP_CXXFLAGS)"[openmp],
                      CXXFLAGS=flags[flags!=""], ## Optionally override cxxflags
                      ...
@@ -1441,9 +1507,11 @@ sparseHessianFun <- function(obj, skipFixedEffects=FALSE) {
   ## ptr.list
   ADHess <- .Call("MakeADHessObject2", obj$env$data, obj$env$parameters,
                   obj$env$reportenv,
-                  skip, ## <-- Skip this index vector of parameters
+                  list(gf=obj$env$ADGrad$ptr, skip=skip), ## <-- Skip this index vector of parameters
                   PACKAGE=obj$env$DLL)
-  ev <- function(par)
+  ## Experiment !
+  .Call("TransformADFunObject", ADHess$ptr, list(random_order = r, method="reorder_random", mustWork=0L, max_period_size=1024L), PACKAGE=obj$env$DLL)
+  ev <- function(par, set_tail=0)
           .Call("EvalADFunObject", ADHess$ptr, par,
                 control = list(
                             order = as.integer(0),
@@ -1452,7 +1520,8 @@ sparseHessianFun <- function(obj, skipFixedEffects=FALSE) {
                             sparsitypattern = as.integer(0),
                             rangecomponent = as.integer(1),
                             dumpstack=as.integer(0),
-                            doforward=as.integer(1)
+                            doforward=as.integer(1),
+                            set_tail = as.integer(set_tail)
                 ), PACKAGE=obj$env$DLL)
   n <- as.integer(length(obj$env$par))
   M <- new("dsTMatrix",
@@ -1463,14 +1532,14 @@ sparseHessianFun <- function(obj, skipFixedEffects=FALSE) {
   Hrandom <- Hfull[r,r,drop=FALSE]
   ## before returning the function, remove unneeded variables from the environment:
   rm(skip, n, M)
-  function(par = obj$env$par, random=FALSE) {
+  function(par = obj$env$par, random=FALSE, set_tail=0) {
     if(!random) {
       Hfull@x[] <- ev(par)
       Hfull
     } else if(skipFixedEffects) {
         .Call("setxslot", Hrandom, ev(par), PACKAGE="TMB")
     } else {
-        Hfull@x[] <- ev(par)
+        Hfull@x[] <- ev(par, set_tail=set_tail)
         Hfull[r,r]
     }
   }
