@@ -142,7 +142,7 @@ struct spde_b{
   }
 };
 
-/** Precision matrix with Barrier procedure. Reimplementation of INLA::inla.barrier.q() in TMB*/    
+/** Precision matrix with Barrier procedure. Reimplementation of INLA::inla.barrier.q() in C++*/    
 template<class Type>
 SparseMatrix<Type> Q_spde(spde_b<Type> spde, Type kappa, vector<Type> c){
   vector <Type> range(2);
@@ -162,7 +162,7 @@ SparseMatrix<Type> Q_spde(spde_b<Type> spde, Type kappa, vector<Type> c){
   SparseMatrix<Type >A = spde.I;
   A = A + (pow(range(0),2)/8) * spde.D0 + (pow(range(1),2)/8) * spde.D1;
   
-  Eigen::SparseMatrix<Type> Q = A.transpose() * Cinv * A/pi *2 * 4; 
+  Eigen::SparseMatrix<Type> Q = A.transpose() * Cinv * A/pi *2 * 3; 
   
   return Q;
 }
